@@ -1,0 +1,31 @@
+{
+  "id": "approval-v1",
+  "start": "request_approval",
+  "nodes": {
+    "request_approval": {
+      "kind": "action",
+      "action": "request_approval",
+      "next": "wait_approval"
+    },
+    "wait_approval": {
+      "kind": "wait",
+      "result": "approval",
+      "timeout_ms": 300,
+      "on_result": "publish_approval",
+      "on_timeout": "send_escalation"
+    },
+    "publish_approval": {
+      "kind": "action",
+      "action": "publish_approval",
+      "next": "succeeded"
+    },
+    "send_escalation": {
+      "kind": "action",
+      "action": "send_escalation",
+      "next": "succeeded"
+    },
+    "succeeded": {
+      "kind": "succeed"
+    }
+  }
+}
