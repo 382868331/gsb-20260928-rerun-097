@@ -29,6 +29,7 @@ const (
 	EvtExternalResult    EventType = "external_result"
 	EvtExternalDuplicate EventType = "external_result_duplicate"
 	EvtWaitTimedOut      EventType = "wait_timed_out"
+	EvtWaitCancelled     EventType = "wait_cancelled"
 	EvtWaitFired         EventType = "wait_fired"
 	EvtActionInvoked     EventType = "action_invoked"
 	EvtActionAcked       EventType = "action_acked"

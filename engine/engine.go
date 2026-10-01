@@ -35,6 +35,14 @@ type waitState struct {
 	deadline time.Time
 }
 
+// waitDecision 是一次等待的唯一最终决定。超时、外部结果、取消
+// 三者无论以什么顺序到达，只有第一个能通过 decideWaitLocked
+// 清除等待状态并胜出；后到者只能被补记，不能改变决定。
+type waitDecision struct {
+	kind   string // "fired" | "timeout" | "cancelled"
+	result string
+}
+
 // Engine 驱动单个 run。所有状态迁移先写历史再生效，
 // 因此任何时候进程退出都能从 Store 重放到同一进度。
 type Engine struct {
@@ -51,7 +59,7 @@ type Engine struct {
 	done      bool
 	started   bool
 	wait      *waitState
-	waitCh    chan string
+	waitCh    chan waitDecision
 	pending   *waitState        // 恢复出的、尚未重新武装的等待
 	results   map[string]string // token -> 已到达的外部结果
 	seen      map[string]bool   // 投递过的 token（含已消费），用于去重
@@ -78,9 +86,16 @@ func (e *Engine) nowMs() int64 { return e.clock.Now().UnixMilli() }
 // append 分配序号并落盘一条事件。
 func (e *Engine) append(ev Event) error {
 	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.appendLocked(ev)
+}
+
+// appendLocked 与 append 相同，但调用方必须已持有 e.mu。
+// 需要保证"决定"与"记录"在同一把锁内完成的路径用它，
+// 这样历史顺序就是真实的决定顺序。
+func (e *Engine) appendLocked(ev Event) error {
 	e.seq++
 	ev.Seq = e.seq
-	e.mu.Unlock()
 	ev.RunID = e.runID
 	ev.DefID = e.def.ID
 	ev.At = e.nowMs()
@@ -220,17 +235,17 @@ func (e *Engine) runWaitStep(stepIndex int, st Step) error {
 	return e.await(token, stepIndex, deadline)
 }
 
-// await 等待外部结果或超时，先到先得；两者同时到达时按实际
-// 被处理的顺序落盘，后到的事件（如迟到结果）仍会补记。
+// await 等待外部结果、超时或取消。三者的竞争在同一把锁内裁决：
+// 第一个清除等待状态的获胜，决定唯一且历史顺序即真实发生顺序。
 func (e *Engine) await(token string, stepIndex int, deadline time.Time) error {
 	e.mu.Lock()
 	if res, ok := e.results[token]; ok {
 		// 结果在调度前已到达（恢复场景）。
 		delete(e.results, token)
 		e.mu.Unlock()
-		return e.finishWait(stepIndex, token, res, false)
+		return e.applyWaitDecision(stepIndex, token, waitDecision{kind: "fired", result: res})
 	}
-	ch := make(chan string, 1)
+	ch := make(chan waitDecision, 1)
 	e.wait = &waitState{token: token, deadline: deadline}
 	e.waitCh = ch
 	e.mu.Unlock()
@@ -243,45 +258,93 @@ func (e *Engine) await(token string, stepIndex int, deadline time.Time) error {
 	defer timer.Stop()
 
 	select {
-	case res := <-ch:
-		return e.finishWait(stepIndex, token, res, false)
+	case d := <-ch:
+		return e.applyWaitDecision(stepIndex, token, d)
 	case <-timer.C:
-		return e.finishWait(stepIndex, token, "", true)
+		// 超时想获胜，也必须在锁内抢到等待状态；抢不到说明
+		// 结果或取消已经先到，改读对方留下的决定。
+		if e.decideWait(token, waitDecision{kind: "timeout"}) {
+			return e.applyWaitDecision(stepIndex, token, waitDecision{kind: "timeout"})
+		}
+		d := <-ch
+		return e.applyWaitDecision(stepIndex, token, d)
 	}
 }
 
-func (e *Engine) finishWait(stepIndex int, token, result string, timedOut bool) error {
-	e.mu.Lock()
-	if e.wait != nil && e.wait.token == token {
-		e.wait = nil
-		e.waitCh = nil
+// decideWaitLocked 尝试为 token 落定决定。只有当前仍持有该
+// 等待的一方能成功；成功后决定通过缓冲 channel 交给等待方应用。
+// 调用方必须持有 e.mu。
+func (e *Engine) decideWaitLocked(token string, d waitDecision) bool {
+	if e.wait == nil || e.wait.token != token {
+		return false
 	}
-	e.mu.Unlock()
+	e.wait = nil
+	ch := e.waitCh
+	e.waitCh = nil
+	ch <- d // channel 容量为 1，此处绝不阻塞
+	return true
+}
 
-	if timedOut {
-		if err := e.append(Event{Type: EvtWaitTimedOut, StepIndex: stepIndex, Token: token}); err != nil {
+func (e *Engine) decideWait(token string, d waitDecision) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.decideWaitLocked(token, d)
+}
+
+// applyWaitDecision 把已胜出的决定落盘并推进步骤。决定事件本身
+// （external_result / wait_cancelled）由胜出方在决定前记录，
+// 这里补记派生事件与 step_completed。推进只在当前步骤匹配时
+// 生效，保证同一次等待不会推进两次。
+func (e *Engine) applyWaitDecision(stepIndex int, token string, d waitDecision) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	switch d.kind {
+	case "fired":
+		if err := e.appendLocked(Event{Type: EvtWaitFired, StepIndex: stepIndex, Token: token, Result: d.result}); err != nil {
 			return err
 		}
-		if err := e.append(Event{Type: EvtStepCompleted, StepIndex: stepIndex, Detail: "timeout"}); err != nil {
+		if err := e.appendLocked(Event{Type: EvtStepCompleted, StepIndex: stepIndex, Result: d.result}); err != nil {
 			return err
 		}
-	} else {
-		if err := e.append(Event{Type: EvtWaitFired, StepIndex: stepIndex, Token: token, Result: result}); err != nil {
+	case "timeout":
+		if err := e.appendLocked(Event{Type: EvtWaitTimedOut, StepIndex: stepIndex, Token: token}); err != nil {
 			return err
 		}
-		if err := e.append(Event{Type: EvtStepCompleted, StepIndex: stepIndex, Result: result}); err != nil {
+		if err := e.appendLocked(Event{Type: EvtStepCompleted, StepIndex: stepIndex, Detail: "timeout"}); err != nil {
+			return err
+		}
+	case "cancelled":
+		if err := e.appendLocked(Event{Type: EvtStepCompleted, StepIndex: stepIndex, Detail: "cancelled"}); err != nil {
 			return err
 		}
 	}
-	e.mu.Lock()
-	e.step = stepIndex + 1
-	e.mu.Unlock()
+	if e.step == stepIndex {
+		e.step = stepIndex + 1
+	}
 	return nil
 }
 
+// CancelWait 取消当前正在进行的等待，与超时、结果公平竞争：
+// 只有等待仍未被决定时取消才生效（返回 true）；已经超时、
+// 已收到结果或已取消的等待不受影响（返回 false）。
+func (e *Engine) CancelWait(stepIndex int, reason string) (bool, error) {
+	token := fmt.Sprintf("%s:wait:%d", e.runID, stepIndex)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.wait == nil || e.wait.token != token {
+		return false, nil
+	}
+	if err := e.appendLocked(Event{Type: EvtWaitCancelled, StepIndex: stepIndex, Token: token, Detail: reason}); err != nil {
+		return false, err
+	}
+	e.decideWaitLocked(token, waitDecision{kind: "cancelled"})
+	return true, nil
+}
+
 // DeliverResult 投递一个外部结果。按实际到达顺序落盘：
-// 等待中的 token 正常生效；重复投递记 duplicate 且只影响一次；
-// 等待已结束（如已超时）时记为迟到结果，不改变已定的步骤结果。
+// 等待中的 token 在锁内立即胜出并生效；重复投递记 duplicate
+// 且只影响一次；等待已结束（如已超时/已取消）时记为迟到结果，
+// 不改变已定的步骤结果。
 func (e *Engine) DeliverResult(token, result string) error {
 	e.mu.Lock()
 	if e.seen[token] {
@@ -289,25 +352,53 @@ func (e *Engine) DeliverResult(token, result string) error {
 		return e.append(Event{Type: EvtExternalDuplicate, Token: token, Result: result})
 	}
 	e.seen[token] = true
-	e.results[token] = result
-	waiting := e.wait != nil && e.wait.token == token
-	ch := e.waitCh
-	e.mu.Unlock()
-
-	detail := ""
-	if !waiting {
-		detail = "late" // 没有对应等待：迟到或超前到达
-	}
-	if err := e.append(Event{Type: EvtExternalResult, Token: token, Result: result, Detail: detail}); err != nil {
-		return err
-	}
-	if waiting && ch != nil {
-		e.mu.Lock()
-		delete(e.results, token) // 由等待方消费
+	if e.wait != nil && e.wait.token == token {
+		// 决定与落盘在同一把锁内：历史里 external_result 一定
+		// 排在由它引发的 wait_fired 之前。
+		if err := e.appendLocked(Event{Type: EvtExternalResult, Token: token, Result: result}); err != nil {
+			e.mu.Unlock()
+			return err
+		}
+		e.decideWaitLocked(token, waitDecision{kind: "fired", result: result})
 		e.mu.Unlock()
-		ch <- result
+		return nil
 	}
-	return nil
+	e.results[token] = result
+	err := e.appendLocked(Event{Type: EvtExternalResult, Token: token, Result: result, Detail: "late"})
+	e.mu.Unlock()
+	return err
+}
+
+// Uncertain 返回当前待核实的不确定动作；没有则返回 nil。
+// 供外部在重试任何有副作用的步骤之前先查询。
+func (e *Engine) Uncertain() *UncertainAction {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.uncertain == nil {
+		return nil
+	}
+	u := *e.uncertain
+	return &u
+}
+
+// HasPendingWait 报告是否存在尚未决定的等待（含恢复出未重新武装的）。
+func (e *Engine) HasPendingWait() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.wait != nil || e.pending != nil
+}
+
+// WaitToken 返回当前等待的 token 与截止时间（毫秒）；无等待时 ok=false。
+func (e *Engine) WaitToken() (token string, deadlineMs int64, ok bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.wait != nil {
+		return e.wait.token, e.wait.deadline.UnixMilli(), true
+	}
+	if e.pending != nil {
+		return e.pending.token, e.pending.deadline.UnixMilli(), true
+	}
+	return "", 0, false
 }
 
 // Recover 从落盘历史重建执行器，恢复到退出前的同一进度。
@@ -336,19 +427,29 @@ func Recover(store *Store, clock Clock, def Definition, runID string, hooks Hook
 		case EvtActionAcked:
 			e.acked[ev.Key] = true
 			delete(invoked, ev.StepIndex)
+			// ack 已落盘而 step_completed 丢失（保存点落在两者之间）：
+			// 决定已生效，恢复后不得重跑该动作。
+			stepDone[ev.StepIndex] = true
 		case EvtExternalResult:
 			e.seen[ev.Token] = true
 			e.results[ev.Token] = ev.Result
 		case EvtWaitScheduled:
 			waitScheduled[ev.Token] = ev.Deadline
-		case EvtWaitFired, EvtWaitTimedOut:
+		case EvtWaitFired, EvtWaitTimedOut, EvtWaitCancelled:
 			waitResolved[ev.Token] = true
 			delete(e.results, ev.Token)
+			// 等待的决定已落盘而 step_completed 丢失时，
+			// 决定本身就是步骤结果，恢复后不再重复推进。
+			stepDone[ev.StepIndex] = true
 		case EvtStepCompleted:
 			stepDone[ev.StepIndex] = true
 		case EvtRunCompleted:
 			e.done = true
 		}
+	}
+	// 已决定的等待不再消费任何结果：迟到的结果只留在历史里。
+	for token := range waitResolved {
+		delete(e.results, token)
 	}
 	// 下一个未完成的步骤。
 	for e.step < len(def.Steps) && stepDone[e.step] {
@@ -387,6 +488,14 @@ func (e *Engine) Pending() []string {
 	if e.step < len(e.def.Steps) {
 		st := e.def.Steps[e.step]
 		out = append(out, fmt.Sprintf("step %d (%s %q): next to execute", e.step, st.Kind, st.Name))
+	}
+	if e.wait != nil {
+		out = append(out, fmt.Sprintf("waiting on token %s until %d (timeout/cancel/result, first decision wins)",
+			e.wait.token, e.wait.deadline.UnixMilli()))
+	}
+	if e.pending != nil {
+		out = append(out, fmt.Sprintf("recovered wait on token %s until %d, will resume on Run",
+			e.pending.token, e.pending.deadline.UnixMilli()))
 	}
 	for token := range e.results {
 		out = append(out, fmt.Sprintf("external result for token %s arrived, not yet consumed", token))
