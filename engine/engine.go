@@ -4,8 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+var engineGeneration atomic.Uint64
 
 // ErrUncertain 表示流程停在一个"已调用但未确认"的外部动作上：
 // 动作超时/出错不代表没有发生，引擎不会自动重试，需要人工核实后
@@ -35,6 +38,18 @@ type waitState struct {
 	deadline time.Time
 }
 
+type waitSignal struct {
+	result   string
+	canceled bool
+}
+
+type waitResolution struct {
+	timedOut bool
+	canceled bool
+	result   string
+	err      error
+}
+
 // Engine 驱动单个 run。所有状态迁移先写历史再生效，
 // 因此任何时候进程退出都能从 Store 重放到同一进度。
 type Engine struct {
@@ -45,32 +60,48 @@ type Engine struct {
 	def   Definition
 	runID string
 	seq   int64
+	gen   uint64
 
-	mu        sync.Mutex
-	step      int
-	done      bool
-	started   bool
-	wait      *waitState
-	waitCh    chan string
-	pending   *waitState        // 恢复出的、尚未重新武装的等待
-	results   map[string]string // token -> 已到达的外部结果
-	seen      map[string]bool   // 投递过的 token（含已消费），用于去重
-	acked     map[string]bool   // 已确认的动作 key
-	uncertain *UncertainAction
+	mu          sync.Mutex
+	step        int
+	done        bool
+	started     bool
+	closed      bool
+	running     bool
+	stopCh      chan struct{}
+	wait        *waitState
+	waitCh      chan waitSignal
+	timeoutCh   chan waitResolution
+	pending     *waitState        // 恢复出的、尚未重新武装的等待
+	results     map[string]string // token -> 已到达的外部结果
+	canceled    map[string]bool   // token -> 已到达的取消信号
+	decided     map[string]EventType
+	recorded    map[string]bool
+	completed   map[int]bool
+	acked       map[string]bool // 已确认的动作 key
+	ackedResult map[string]string
+	uncertain   *UncertainAction
 }
 
 func NewEngine(store *Store, clock Clock, hooks Hooks) *Engine {
 	if clock == nil {
 		clock = systemClock{}
 	}
-	return &Engine{
-		store:   store,
-		clock:   clock,
-		hooks:   hooks,
-		results: map[string]string{},
-		seen:    map[string]bool{},
-		acked:   map[string]bool{},
+	e := &Engine{
+		store:       store,
+		clock:       clock,
+		hooks:       hooks,
+		results:     map[string]string{},
+		canceled:    map[string]bool{},
+		decided:     map[string]EventType{},
+		recorded:    map[string]bool{},
+		completed:   map[int]bool{},
+		acked:       map[string]bool{},
+		ackedResult: map[string]string{},
 	}
+	e.stopCh = make(chan struct{})
+	e.gen = engineGeneration.Add(1)
+	return e
 }
 
 func (e *Engine) nowMs() int64 { return e.clock.Now().UnixMilli() }
@@ -78,9 +109,16 @@ func (e *Engine) nowMs() int64 { return e.clock.Now().UnixMilli() }
 // append 分配序号并落盘一条事件。
 func (e *Engine) append(ev Event) error {
 	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.appendLocked(ev)
+}
+
+func (e *Engine) appendLocked(ev Event) error {
+	if e.gen == 0 {
+		return errors.New("engine: closed execution context")
+	}
 	e.seq++
 	ev.Seq = e.seq
-	e.mu.Unlock()
 	ev.RunID = e.runID
 	ev.DefID = e.def.ID
 	ev.At = e.nowMs()
@@ -102,6 +140,14 @@ func (e *Engine) Start(def Definition, runID string, actions map[string]Action) 
 func (e *Engine) Run(actions map[string]Action) error {
 	for {
 		e.mu.Lock()
+		if e.closed {
+			e.mu.Unlock()
+			return nil
+		}
+		if e.running {
+			e.mu.Unlock()
+			return nil
+		}
 		if e.done {
 			e.mu.Unlock()
 			return nil
@@ -119,21 +165,58 @@ func (e *Engine) Run(actions map[string]Action) error {
 		st := e.def.Steps[stepIndex]
 		pending := e.pending
 		e.pending = nil
+		var pendingDeadline time.Time
+		if pending != nil {
+			pendingDeadline = pending.deadline
+			pending = nil
+		}
+		key := fmt.Sprintf("%s:action:%d", e.runID, stepIndex)
+		if st.Kind == "action" && e.acked[key] && !e.completed[stepIndex] {
+			result := e.ackedResult[key]
+			e.mu.Unlock()
+			if err := e.append(Event{Type: EvtStepCompleted, StepIndex: stepIndex, Result: result}); err != nil {
+				return err
+			}
+			e.mu.Lock()
+			e.completed[stepIndex] = true
+			e.step = stepIndex + 1
+			e.mu.Unlock()
+			continue
+		}
 		e.mu.Unlock()
+
+		var active bool
 
 		var err error
 		switch st.Kind {
 		case "action":
 			err = e.runActionStep(stepIndex, st, actions)
 		case "wait":
-			if pending != nil {
-				// 恢复场景：沿用原 token 与截止时间继续等。
-				err = e.await(pending.token, stepIndex, pending.deadline)
-			} else {
+			e.mu.Lock()
+			token := fmt.Sprintf("%s:wait:%d", e.runID, stepIndex)
+			e.running = true
+			_, hasResult := e.results[token]
+			hasInput := hasResult || e.canceled[token] || e.decided[token] != ""
+			e.mu.Unlock()
+			active = true
+			if hasInput {
+				deadline := pendingDeadline
+				if deadline.IsZero() {
+					deadline = e.clock.Now()
+				}
+				err = e.await(token, stepIndex, deadline)
+			} else if pendingDeadline.IsZero() {
 				err = e.runWaitStep(stepIndex, st)
+			} else {
+				err = e.await(token, stepIndex, pendingDeadline)
 			}
 		default:
 			err = fmt.Errorf("engine: unknown step kind %q", st.Kind)
+		}
+		if active {
+			e.mu.Lock()
+			e.running = false
+			e.mu.Unlock()
 		}
 		if err != nil {
 			return err
@@ -180,6 +263,8 @@ func (e *Engine) completeAction(stepIndex int, key, result string) error {
 	}
 	e.mu.Lock()
 	e.acked[key] = true
+	e.ackedResult[key] = result
+	e.completed[stepIndex] = true
 	e.step = stepIndex + 1
 	e.mu.Unlock()
 	return nil
@@ -208,6 +293,16 @@ func (e *Engine) ConfirmAction(stepIndex int, result string) (bool, error) {
 	return true, nil
 }
 
+// UncertainActions 返回当前所有已调用但结果未确认的外部动作。
+func (e *Engine) UncertainActions() []UncertainAction {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.uncertain == nil {
+		return nil
+	}
+	return []UncertainAction{*e.uncertain}
+}
+
 func (e *Engine) runWaitStep(stepIndex int, st Step) error {
 	token := fmt.Sprintf("%s:wait:%d", e.runID, stepIndex)
 	deadline := e.clock.Now().Add(time.Duration(st.TimeoutMS) * time.Millisecond)
@@ -220,19 +315,38 @@ func (e *Engine) runWaitStep(stepIndex int, st Step) error {
 	return e.await(token, stepIndex, deadline)
 }
 
-// await 等待外部结果或超时，先到先得；两者同时到达时按实际
-// 被处理的顺序落盘，后到的事件（如迟到结果）仍会补记。
+// await 等待外部结果、取消或超时。状态迁移与历史写入在同一临界区完成，
+// 因此保存点只能落在完整、可解释的状态边界上。
 func (e *Engine) await(token string, stepIndex int, deadline time.Time) error {
 	e.mu.Lock()
-	if res, ok := e.results[token]; ok {
-		// 结果在调度前已到达（恢复场景）。
+	if decision, ok := e.decided[token]; ok {
+		resolution := waitResolution{result: e.results[token]}
+		if decision == EvtWaitTimedOut {
+			resolution.timedOut = true
+		}
+		if decision == EvtWaitCanceled {
+			resolution.canceled = true
+		}
 		delete(e.results, token)
+		err := e.finishWaitLocked(stepIndex, token, resolution)
 		e.mu.Unlock()
-		return e.finishWait(stepIndex, token, res, false)
+		return err
 	}
-	ch := make(chan string, 1)
+	if e.canceled[token] {
+		err := e.finishWaitLocked(stepIndex, token, waitResolution{canceled: true})
+		e.mu.Unlock()
+		return err
+	}
+	if result, ok := e.results[token]; ok {
+		err := e.finishWaitLocked(stepIndex, token, waitResolution{result: result})
+		e.mu.Unlock()
+		return err
+	}
+	ch := make(chan waitSignal, 1)
+	timeoutCh := make(chan waitResolution, 1)
 	e.wait = &waitState{token: token, deadline: deadline}
 	e.waitCh = ch
+	e.timeoutCh = timeoutCh
 	e.mu.Unlock()
 
 	remaining := time.Until(deadline)
@@ -241,73 +355,212 @@ func (e *Engine) await(token string, stepIndex int, deadline time.Time) error {
 	}
 	timer := time.NewTimer(remaining)
 	defer timer.Stop()
+	go func() {
+		<-timer.C
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		if e.closed {
+			return
+		}
+		if e.wait == nil || e.wait.token != token {
+			return
+		}
+		ch := e.timeoutCh
+		resolution := waitResolution{timedOut: true}
+		resolution.err = e.recordTimeoutDecisionLocked(stepIndex, token, resolution)
+		e.clearWaitLocked(token)
+		if ch != nil {
+			ch <- resolution
+		}
+	}()
 
 	select {
-	case res := <-ch:
-		return e.finishWait(stepIndex, token, res, false)
-	case <-timer.C:
-		return e.finishWait(stepIndex, token, "", true)
+	case sig := <-ch:
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		e.clearWaitLocked(token)
+		return e.recordExternalDecisionLocked(stepIndex, token, sig)
+	case res := <-timeoutCh:
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		e.clearWaitLocked(token)
+		if res.err != nil {
+			return res.err
+		}
+		return e.recordTimeoutDecisionLocked(stepIndex, token, res)
+	case <-e.stopCh:
+		return nil
 	}
 }
 
-func (e *Engine) finishWait(stepIndex int, token, result string, timedOut bool) error {
+// Close 标记本进程实例不再等待。持久历史不会被修改；之后可由 Recover 重开。
+func (e *Engine) Close() {
 	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return
+	}
+	e.closed = true
+	e.gen = 0
+	e.wait = nil
+	e.waitCh = nil
+	e.timeoutCh = nil
+	close(e.stopCh)
+}
+
+func (e *Engine) clearWaitLocked(token string) {
 	if e.wait != nil && e.wait.token == token {
 		e.wait = nil
 		e.waitCh = nil
+		e.timeoutCh = nil
 	}
-	e.mu.Unlock()
+}
 
-	if timedOut {
-		if err := e.append(Event{Type: EvtWaitTimedOut, StepIndex: stepIndex, Token: token}); err != nil {
+func (e *Engine) finishWaitLocked(stepIndex int, token string, resolution waitResolution) error {
+	if _, ok := e.decided[token]; !ok {
+		if resolution.timedOut {
+			e.decided[token] = EvtWaitTimedOut
+		} else if resolution.canceled {
+			e.decided[token] = EvtWaitCanceled
+		} else {
+			e.decided[token] = EvtWaitFired
+			e.results[token] = resolution.result
+		}
+	}
+	return e.completeDecidedWaitLocked(stepIndex, token)
+}
+
+func (e *Engine) completeDecidedWaitLocked(stepIndex int, token string) error {
+	if e.completed[stepIndex] {
+		e.step = stepIndex + 1
+		return nil
+	}
+	if e.recorded[token] {
+		detail := ""
+		if e.decided[token] == EvtWaitTimedOut {
+			detail = "timeout"
+		}
+		if e.decided[token] == EvtWaitCanceled {
+			detail = "canceled"
+		}
+		result := e.results[token]
+		if err := e.appendLocked(Event{Type: EvtStepCompleted, StepIndex: stepIndex, Result: result, Detail: detail}); err != nil {
 			return err
 		}
-		if err := e.append(Event{Type: EvtStepCompleted, StepIndex: stepIndex, Detail: "timeout"}); err != nil {
+		e.completed[stepIndex] = true
+		e.step = stepIndex + 1
+		return nil
+	}
+	e.recorded[token] = true
+	switch e.decided[token] {
+	case EvtWaitTimedOut:
+		if err := e.appendLocked(Event{Type: EvtWaitTimedOut, StepIndex: stepIndex, Token: token}); err != nil {
 			return err
 		}
-	} else {
-		if err := e.append(Event{Type: EvtWaitFired, StepIndex: stepIndex, Token: token, Result: result}); err != nil {
+		if err := e.appendLocked(Event{Type: EvtStepCompleted, StepIndex: stepIndex, Detail: "timeout"}); err != nil {
 			return err
 		}
-		if err := e.append(Event{Type: EvtStepCompleted, StepIndex: stepIndex, Result: result}); err != nil {
+	case EvtWaitCanceled:
+		if err := e.appendLocked(Event{Type: EvtWaitCanceled, StepIndex: stepIndex, Token: token}); err != nil {
+			return err
+		}
+		if err := e.appendLocked(Event{Type: EvtStepCompleted, StepIndex: stepIndex, Detail: "canceled"}); err != nil {
+			return err
+		}
+	default:
+		result := e.results[token]
+		if err := e.appendLocked(Event{Type: EvtWaitFired, StepIndex: stepIndex, Token: token, Result: result}); err != nil {
+			return err
+		}
+		if err := e.appendLocked(Event{Type: EvtStepCompleted, StepIndex: stepIndex, Result: result}); err != nil {
 			return err
 		}
 	}
-	e.mu.Lock()
+	e.completed[stepIndex] = true
 	e.step = stepIndex + 1
-	e.mu.Unlock()
 	return nil
 }
 
-// DeliverResult 投递一个外部结果。按实际到达顺序落盘：
-// 等待中的 token 正常生效；重复投递记 duplicate 且只影响一次；
-// 等待已结束（如已超时）时记为迟到结果，不改变已定的步骤结果。
-func (e *Engine) DeliverResult(token, result string) error {
-	e.mu.Lock()
-	if e.seen[token] {
-		e.mu.Unlock()
-		return e.append(Event{Type: EvtExternalDuplicate, Token: token, Result: result})
+func (e *Engine) recordExternalDecisionLocked(stepIndex int, token string, signal waitSignal) error {
+	if _, ok := e.decided[token]; ok {
+		e.step = stepIndex + 1
+		return nil
 	}
-	e.seen[token] = true
-	e.results[token] = result
+	if signal.canceled {
+		e.canceled[token] = true
+		e.decided[token] = EvtWaitCanceled
+	} else {
+		e.results[token] = signal.result
+		e.decided[token] = EvtWaitFired
+	}
+	return e.completeDecidedWaitLocked(stepIndex, token)
+}
+
+func (e *Engine) recordTimeoutDecisionLocked(stepIndex int, token string, _ waitResolution) error {
+	if _, ok := e.decided[token]; ok {
+		e.step = stepIndex + 1
+		return nil
+	}
+	e.decided[token] = EvtWaitTimedOut
+	return e.completeDecidedWaitLocked(stepIndex, token)
+}
+
+// DeliverResult 投递一个外部结果。历史先持久化，然后唤醒等待方。
+func (e *Engine) DeliverResult(token, result string) error {
+	return e.deliverExternal(token, result, false)
+}
+
+// CancelWait 投递外部取消信号。它与结果共用同一先到先得裁决。
+func (e *Engine) CancelWait(token, reason string) error {
+	return e.deliverExternal(token, reason, true)
+}
+
+func (e *Engine) deliverExternal(token, value string, canceled bool) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	duplicate := (!canceled && e.results[token] != "") || (canceled && e.canceled[token])
+	if duplicate {
+		detail := "result"
+		if canceled {
+			detail = "cancel"
+		}
+		return e.appendLocked(Event{Type: EvtExternalDuplicate, Token: token, Result: value, Detail: detail})
+	}
+
 	waiting := e.wait != nil && e.wait.token == token
 	ch := e.waitCh
-	e.mu.Unlock()
-
+	evType := EvtExternalResult
+	if canceled {
+		evType = EvtExternalCancel
+		e.canceled[token] = true
+	} else {
+		e.results[token] = value
+	}
 	detail := ""
 	if !waiting {
-		detail = "late" // 没有对应等待：迟到或超前到达
+		detail = "late"
 	}
-	if err := e.append(Event{Type: EvtExternalResult, Token: token, Result: result, Detail: detail}); err != nil {
+	if err := e.appendLocked(Event{Type: evType, Token: token, Result: value, Detail: detail}); err != nil {
 		return err
 	}
 	if waiting && ch != nil {
-		e.mu.Lock()
-		delete(e.results, token) // 由等待方消费
-		e.mu.Unlock()
-		ch <- result
+		signal := waitSignal{result: value, canceled: canceled}
+		if err := e.recordExternalDecisionLocked(e.waitStepIndexLocked(token), token, signal); err != nil {
+			return err
+		}
+		e.clearWaitLocked(token)
+		ch <- signal
 	}
 	return nil
+}
+
+func (e *Engine) waitStepIndexLocked(token string) int {
+	for i := range e.def.Steps {
+		if e.def.Steps[i].Kind == "wait" && fmt.Sprintf("%s:wait:%d", e.runID, i) == token {
+			return i
+		}
+	}
+	return -1
 }
 
 // Recover 从落盘历史重建执行器，恢复到退出前的同一进度。
@@ -321,9 +574,9 @@ func Recover(store *Store, clock Clock, def Definition, runID string, hooks Hook
 		return nil, err
 	}
 	stepDone := map[int]bool{}
-	waitResolved := map[string]bool{}
 	waitScheduled := map[string]int64{} // token -> deadline_ms
-	invoked := map[int]string{}         // stepIndex -> key
+	waitDecision := map[string]EventType{}
+	invoked := map[int]string{} // stepIndex -> key
 	for _, ev := range events {
 		if ev.Seq > e.seq {
 			e.seq = ev.Seq
@@ -335,15 +588,24 @@ func Recover(store *Store, clock Clock, def Definition, runID string, hooks Hook
 			invoked[ev.StepIndex] = ev.Key
 		case EvtActionAcked:
 			e.acked[ev.Key] = true
+			e.ackedResult[ev.Key] = ev.Result
 			delete(invoked, ev.StepIndex)
 		case EvtExternalResult:
-			e.seen[ev.Token] = true
 			e.results[ev.Token] = ev.Result
+		case EvtExternalCancel:
+			e.canceled[ev.Token] = true
 		case EvtWaitScheduled:
 			waitScheduled[ev.Token] = ev.Deadline
-		case EvtWaitFired, EvtWaitTimedOut:
-			waitResolved[ev.Token] = true
+		case EvtWaitFired:
+			waitDecision[ev.Token] = ev.Type
+			e.recorded[ev.Token] = true
 			delete(e.results, ev.Token)
+		case EvtWaitTimedOut:
+			waitDecision[ev.Token] = ev.Type
+			e.recorded[ev.Token] = true
+		case EvtWaitCanceled:
+			waitDecision[ev.Token] = ev.Type
+			e.recorded[ev.Token] = true
 		case EvtStepCompleted:
 			stepDone[ev.StepIndex] = true
 		case EvtRunCompleted:
@@ -354,6 +616,9 @@ func Recover(store *Store, clock Clock, def Definition, runID string, hooks Hook
 	for e.step < len(def.Steps) && stepDone[e.step] {
 		e.step++
 	}
+	for stepIndex := range stepDone {
+		e.completed[stepIndex] = true
+	}
 	if !e.done && e.step < len(def.Steps) {
 		st := def.Steps[e.step]
 		if key, ok := invoked[e.step]; ok && st.Kind == "action" {
@@ -362,8 +627,14 @@ func Recover(store *Store, clock Clock, def Definition, runID string, hooks Hook
 		}
 		if st.Kind == "wait" {
 			token := fmt.Sprintf("%s:wait:%d", e.runID, e.step)
-			if dl, ok := waitScheduled[token]; ok && !waitResolved[token] {
-				e.pending = &waitState{token: token, deadline: time.UnixMilli(dl)}
+			if decision, ok := waitDecision[token]; ok {
+				e.decided[token] = decision
+			} else {
+				if _, resultArrived := e.results[token]; !resultArrived && !e.canceled[token] {
+					if dl, ok := waitScheduled[token]; ok {
+						e.pending = &waitState{token: token, deadline: time.UnixMilli(dl)}
+					}
+				}
 			}
 		}
 	}

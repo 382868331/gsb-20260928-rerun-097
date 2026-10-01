@@ -229,6 +229,7 @@ func TestLostAckAndWaitRecovery(t *testing.T) {
 	waitFor(func(e []Event) bool { return countType(e, EvtWaitScheduled) == 1 }, "wait scheduled")
 
 	// 进程二在等待中"退出"（丢弃 eng2，不投递结果）。
+	eng2.Close()
 	// 进程三：恢复 -> 应识别出进行中的等待及其截止时间，继续等同一个 token。
 	eng3, _ := Recover(store, systemClock{}, def, "r3", Hooks{})
 	pending := eng3.Pending()
@@ -263,4 +264,223 @@ func TestLostAckAndWaitRecovery(t *testing.T) {
 		t.Fatal("finish executed once")
 	}
 	_ = typesOf // keep helper referenced if unused elsewhere
+}
+
+func waitRaceDef() Definition {
+	return Definition{ID: 4, Name: "race", Steps: []Step{
+		{Kind: "wait", Name: "wait", TimeoutMS: 20},
+		{Kind: "action", Name: "next", Action: "next"},
+	}}
+}
+
+func waitUntilScheduled(t *testing.T, store *Store, runID string) {
+	t.Helper()
+	for i := 0; i < 2000; i++ {
+		events, err := store.Load(runID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if countType(events, EvtWaitScheduled) == 1 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("wait was not scheduled")
+}
+
+func assertExactlyOneDecision(t *testing.T, events []Event) {
+	t.Helper()
+	fired := countType(events, EvtWaitFired)
+	timedOut := countType(events, EvtWaitTimedOut)
+	canceled := countType(events, EvtWaitCanceled)
+	if fired+timedOut+canceled != 1 {
+		t.Fatalf("expected one wait decision, got fired=%d timed_out=%d canceled=%d", fired, timedOut, canceled)
+	}
+}
+
+func TestWaitSignalArrivalOrders(t *testing.T) {
+	cases := []struct {
+		name       string
+		send       func(*Engine)
+		decision   EventType
+		historical []EventType
+	}{
+		{
+			name: "result before cancellation",
+			send: func(eng *Engine) {
+				if err := eng.DeliverResult("r-result-cancel:wait:0", "result"); err != nil {
+					t.Fatal(err)
+				}
+				if err := eng.CancelWait("r-result-cancel:wait:0", "cancel"); err != nil {
+					t.Fatal(err)
+				}
+			},
+			decision:   EvtWaitFired,
+			historical: []EventType{EvtWaitScheduled, EvtExternalResult, EvtWaitFired, EvtStepCompleted, EvtExternalCancel},
+		},
+		{
+			name: "cancellation before result",
+			send: func(eng *Engine) {
+				if err := eng.CancelWait("r-cancel-result:wait:0", "cancel"); err != nil {
+					t.Fatal(err)
+				}
+				if err := eng.DeliverResult("r-cancel-result:wait:0", "result"); err != nil {
+					t.Fatal(err)
+				}
+			},
+			decision:   EvtWaitCanceled,
+			historical: []EventType{EvtWaitScheduled, EvtExternalCancel, EvtWaitCanceled, EvtStepCompleted, EvtExternalResult},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			store, _ := NewStore(dir)
+			var calls int32
+			actions := map[string]Action{"next": &countingAction{name: "next", calls: &calls, res: "done"}}
+			eng := NewEngine(store, systemClock{}, Hooks{})
+			runID := "r-result-cancel"
+			if tc.decision == EvtWaitCanceled {
+				runID = "r-cancel-result"
+			}
+			done := make(chan error, 1)
+			go func() { done <- eng.Start(waitRaceDef(), runID, actions) }()
+			waitUntilScheduled(t, store, runID)
+			tc.send(eng)
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			events, _ := store.Load(runID)
+			assertExactlyOneDecision(t, events)
+			if events[3].Type != tc.historical[1] || events[4].Type != tc.decision {
+				t.Fatalf("unexplained order: %v", typesOf(events))
+			}
+			if atomic.LoadInt32(&calls) != 1 || countType(events, EvtActionInvoked) != 1 {
+				t.Fatal("next step must advance exactly once")
+			}
+		})
+	}
+
+	t.Run("timeout before result", func(t *testing.T) {
+		dir := t.TempDir()
+		store, _ := NewStore(dir)
+		var calls int32
+		actions := map[string]Action{"next": &countingAction{name: "next", calls: &calls, res: "done"}}
+		eng := NewEngine(store, systemClock{}, Hooks{})
+		runID := "r-timeout-result"
+		done := make(chan error, 1)
+		go func() { done <- eng.Start(waitRaceDef(), runID, actions) }()
+		waitUntilScheduled(t, store, runID)
+		time.Sleep(40 * time.Millisecond)
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		if err := eng.DeliverResult("r-timeout-result:wait:0", "late"); err != nil {
+			t.Fatal(err)
+		}
+		events, _ := store.Load(runID)
+		assertExactlyOneDecision(t, events)
+		if events[3].Type != EvtWaitTimedOut || events[len(events)-1].Type != EvtExternalResult {
+			t.Fatalf("timeout must remain the decision, got %v", typesOf(events))
+		}
+		if countType(events, EvtWaitFired) != 0 || atomic.LoadInt32(&calls) != 1 {
+			t.Fatal("late result must not become normal completion or advance again")
+		}
+	})
+}
+
+func TestRecoverAtWaitSavepoints(t *testing.T) {
+	def := waitRaceDef()
+	actions := func() (map[string]Action, *int32) {
+		var calls int32
+		return map[string]Action{"next": &countingAction{name: "next", calls: &calls, res: "done"}}, &calls
+	}
+
+	t.Run("result before armed wait", func(t *testing.T) {
+		dir := t.TempDir()
+		store, _ := NewStore(dir)
+		runID := "r-early-result"
+		base := int64(1)
+		for _, ev := range []Event{
+			{Type: EvtRunStarted},
+			{Type: EvtStepStarted, StepIndex: 0},
+			{Type: EvtWaitScheduled, StepIndex: 0, Token: runID + ":wait:0", Deadline: time.Now().Add(time.Hour).UnixMilli()},
+			{Type: EvtExternalResult, Token: runID + ":wait:0", Result: "arrived", Detail: "late"},
+		} {
+			ev.Seq = base
+			ev.RunID = runID
+			ev.DefID = def.ID
+			ev.At = time.Now().UnixMilli()
+			base++
+			if err := store.Append(ev); err != nil {
+				t.Fatal(err)
+			}
+		}
+		acts, calls := actions()
+		eng, err := Recover(store, systemClock{}, def, runID, Hooks{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := eng.Run(acts); err != nil {
+			t.Fatal(err)
+		}
+		events, _ := store.Load(runID)
+		assertExactlyOneDecision(t, events)
+		if events[4].Type != EvtWaitFired || atomic.LoadInt32(calls) != 1 {
+			t.Fatalf("confirmed result must resume once: %v", typesOf(events))
+		}
+	})
+
+	t.Run("timeout decision before completion", func(t *testing.T) {
+		dir := t.TempDir()
+		store, _ := NewStore(dir)
+		runID := "r-timeout-savepoint"
+		token := runID + ":wait:0"
+		base := int64(1)
+		for _, ev := range []Event{
+			{Type: EvtRunStarted},
+			{Type: EvtStepStarted, StepIndex: 0},
+			{Type: EvtWaitScheduled, StepIndex: 0, Token: token, Deadline: time.Now().Add(-time.Minute).UnixMilli()},
+			{Type: EvtWaitTimedOut, StepIndex: 0, Token: token},
+			{Type: EvtExternalResult, Token: token, Result: "late", Detail: "late"},
+		} {
+			ev.Seq = base
+			ev.RunID = runID
+			ev.DefID = def.ID
+			ev.At = time.Now().UnixMilli()
+			base++
+			if err := store.Append(ev); err != nil {
+				t.Fatal(err)
+			}
+		}
+		acts, calls := actions()
+		eng, _ := Recover(store, systemClock{}, def, runID, Hooks{})
+		if err := eng.Run(acts); err != nil {
+			t.Fatal(err)
+		}
+		events, _ := store.Load(runID)
+		assertExactlyOneDecision(t, events)
+		if events[5].Type != EvtStepCompleted || events[5].Detail != "timeout" || atomic.LoadInt32(calls) != 1 {
+			t.Fatalf("history must stay timeout-compatible: %v", typesOf(events))
+		}
+	})
+}
+
+func TestUncertainActionsQuery(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := NewStore(dir)
+	def := Definition{ID: 5, Steps: []Step{{Kind: "action", Name: "charge", Action: "charge"}}}
+	var calls int32
+	actions := map[string]Action{"charge": &countingAction{name: "charge", calls: &calls, err: errors.New("delivery timeout")}}
+	eng := NewEngine(store, systemClock{}, Hooks{})
+	if err := eng.Start(def, "r-uncertain", actions); !errors.Is(err, ErrUncertain) {
+		t.Fatalf("expected uncertain, got %v", err)
+	}
+	pending := eng.UncertainActions()
+	if len(pending) != 1 || pending[0].StepIndex != 0 || pending[0].Key != "r-uncertain:action:0" {
+		t.Fatalf("unexpected uncertain actions: %+v", pending)
+	}
+	if err := eng.Run(actions); !errors.Is(err, ErrUncertain) || atomic.LoadInt32(&calls) != 1 {
+		t.Fatal("uncertain action must not be retried")
+	}
 }
