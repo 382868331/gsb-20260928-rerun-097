@@ -62,25 +62,30 @@ type Engine struct {
 	seq   int64
 	gen   uint64
 
-	mu          sync.Mutex
-	step        int
-	done        bool
-	started     bool
-	closed      bool
-	running     bool
-	stopCh      chan struct{}
-	wait        *waitState
-	waitCh      chan waitSignal
-	timeoutCh   chan waitResolution
-	pending     *waitState        // 恢复出的、尚未重新武装的等待
-	results     map[string]string // token -> 已到达的外部结果
-	canceled    map[string]bool   // token -> 已到达的取消信号
-	decided     map[string]EventType
-	recorded    map[string]bool
-	completed   map[int]bool
-	acked       map[string]bool // 已确认的动作 key
-	ackedResult map[string]string
-	uncertain   *UncertainAction
+	mu             sync.Mutex
+	step           int
+	done           bool
+	started        bool
+	closed         bool
+	running        bool
+	stopCh         chan struct{}
+	wait           *waitState
+	waitCh         chan waitSignal
+	timeoutCh      chan waitResolution
+	pending        *waitState        // 恢复出的、尚未重新武装的等待
+	results        map[string]string // token -> 已到达的外部结果
+	canceled       map[string]bool   // token -> 已到达的取消信号
+	decided        map[string]EventType
+	recorded       map[string]bool
+	completed      map[int]bool
+	acked          map[string]bool // 已确认的动作 key
+	ackedResult    map[string]string
+	uncertain      *UncertainAction
+	currentGroup   *groupState
+	groupByToken   map[string]*groupState
+	branchByToken  map[string]*branchState
+	groupWaitCh    map[string]chan struct{}
+	groupUncertain []UncertainEffect
 }
 
 func NewEngine(store *Store, clock Clock, hooks Hooks) *Engine {
@@ -88,16 +93,19 @@ func NewEngine(store *Store, clock Clock, hooks Hooks) *Engine {
 		clock = systemClock{}
 	}
 	e := &Engine{
-		store:       store,
-		clock:       clock,
-		hooks:       hooks,
-		results:     map[string]string{},
-		canceled:    map[string]bool{},
-		decided:     map[string]EventType{},
-		recorded:    map[string]bool{},
-		completed:   map[int]bool{},
-		acked:       map[string]bool{},
-		ackedResult: map[string]string{},
+		store:         store,
+		clock:         clock,
+		hooks:         hooks,
+		results:       map[string]string{},
+		canceled:      map[string]bool{},
+		decided:       map[string]EventType{},
+		recorded:      map[string]bool{},
+		completed:     map[int]bool{},
+		acked:         map[string]bool{},
+		ackedResult:   map[string]string{},
+		groupByToken:  map[string]*groupState{},
+		branchByToken: map[string]*branchState{},
+		groupWaitCh:   map[string]chan struct{}{},
 	}
 	e.stopCh = make(chan struct{})
 	e.gen = engineGeneration.Add(1)
@@ -156,6 +164,10 @@ func (e *Engine) Run(actions map[string]Action) error {
 			e.mu.Unlock()
 			return ErrUncertain
 		}
+		if len(e.groupUncertain) > 0 {
+			e.mu.Unlock()
+			return ErrUncertain
+		}
 		if e.step >= len(e.def.Steps) {
 			e.done = true
 			e.mu.Unlock()
@@ -191,6 +203,12 @@ func (e *Engine) Run(actions map[string]Action) error {
 		switch st.Kind {
 		case "action":
 			err = e.runActionStep(stepIndex, st, actions)
+		case "group":
+			e.mu.Lock()
+			e.running = true
+			e.mu.Unlock()
+			active = true
+			err = e.runGroupStep(stepIndex, st, actions)
 		case "wait":
 			e.mu.Lock()
 			token := fmt.Sprintf("%s:wait:%d", e.runID, stepIndex)
@@ -577,6 +595,8 @@ func Recover(store *Store, clock Clock, def Definition, runID string, hooks Hook
 	waitScheduled := map[string]int64{} // token -> deadline_ms
 	waitDecision := map[string]EventType{}
 	invoked := map[int]string{} // stepIndex -> key
+	groupTree := map[int]*groupState{}
+	branchInvokedUnacked := map[string]bool{}
 	for _, ev := range events {
 		if ev.Seq > e.seq {
 			e.seq = ev.Seq
@@ -590,10 +610,89 @@ func Recover(store *Store, clock Clock, def Definition, runID string, hooks Hook
 			e.acked[ev.Key] = true
 			e.ackedResult[ev.Key] = ev.Result
 			delete(invoked, ev.StepIndex)
+		case EvtGroupOpened:
+			g, ok := groupTree[ev.StepIndex]
+			if !ok {
+				g = buildGroupTree(e.runID, ev.StepIndex, def.Steps[ev.StepIndex].Group)
+				groupTree[ev.StepIndex] = g
+				e.registerGroupLocked(g)
+			}
+			if target := findGroupByToken(g, ev.Token); target != nil {
+				target.opened = true
+				target.deadline = time.UnixMilli(ev.Deadline)
+				target.hasDeadline = ev.Deadline != 0
+			}
+		case EvtBranchScheduled:
+			if b := e.branchByToken[ev.Token]; b != nil {
+				b.scheduled = true
+				if attempt := parseAttempt(ev.Result); attempt > 0 {
+					b.attempt = attempt
+				}
+				b.deadline = time.UnixMilli(ev.Deadline)
+				b.hasDeadline = ev.Deadline > 0
+			}
+		case EvtBranchActionInvoked:
+			branchInvokedUnacked[ev.Key] = true
+			if b := e.branchByToken[ev.Token]; b != nil {
+				b.actionKey = ev.Key
+				if a := parseAttempt(ev.Detail); a > 0 {
+					b.attempt = a
+				}
+			}
+		case EvtBranchActionAcked:
+			delete(branchInvokedUnacked, ev.Key)
+			if b := e.branchByToken[ev.Token]; b != nil {
+				if a := parseAttempt(ev.Detail); a > 0 && a == b.attempt {
+					b.actionPending = false
+				}
+			}
+		case EvtBranchRetried:
+			if b := e.branchByToken[ev.Token]; b != nil {
+				if a := parseAttempt(ev.Result); a > 0 {
+					b.attempt = a
+				}
+				b.terminal = false
+				b.outcome = nil
+				b.cancelAsked = false
+			}
 		case EvtExternalResult:
-			e.results[ev.Token] = ev.Result
+			if b := e.branchByToken[ev.Token]; b != nil {
+				restoreBranchTerminal(b, outcomeSuccess, ev.Result, ev.Detail == "late")
+			} else {
+				e.results[ev.Token] = ev.Result
+			}
+		case EvtBranchFailure:
+			if b := e.branchByToken[ev.Token]; b != nil {
+				restoreBranchTerminal(b, outcomeFailure, ev.Result, ev.Detail == "late")
+			}
 		case EvtExternalCancel:
-			e.canceled[ev.Token] = true
+			if b := e.branchByToken[ev.Token]; b != nil {
+				restoreBranchTerminal(b, outcomeCancel, ev.Result, ev.Detail == "late")
+			} else {
+				e.canceled[ev.Token] = true
+			}
+		case EvtBranchTimedOut:
+			if b := e.branchByToken[ev.Token]; b != nil {
+				restoreBranchTerminal(b, outcomeTimeout, "", false)
+			}
+		case EvtGroupCancelRequested:
+			if b := e.branchByToken[ev.Token]; b != nil {
+				b.cancelAsked = true
+			}
+		case EvtGroupDecided:
+			if g := findGroupByToken(groupTree[ev.StepIndex], ev.Token); g != nil {
+				g.decided = true
+				g.satisfied = ev.Detail == "satisfied"
+				g.exhausted = !g.satisfied
+				g.selected = parseSelected(ev.Extra)
+				if !g.satisfied && !g.spec.CollectRemaining {
+					g.cancelSent = true
+				}
+			}
+		case EvtGroupCompleted:
+			if g := groupTree[ev.StepIndex]; g != nil && g.token == ev.Token {
+				g.completed = true
+			}
 		case EvtWaitScheduled:
 			waitScheduled[ev.Token] = ev.Deadline
 		case EvtWaitFired:
@@ -637,6 +736,21 @@ func Recover(store *Store, clock Clock, def Definition, runID string, hooks Hook
 				}
 			}
 		}
+		if st.Kind == "group" {
+			if g, ok := groupTree[e.step]; ok {
+				e.currentGroup = g
+				// 已触发未确认的分支 action：单独保留为未核实外部效果。
+				for _, b := range g.allLeaves(e) {
+					key := branchActionKey(b.token, b.attempt)
+					if branchInvokedUnacked[key] {
+						b.actionPending = true
+						e.groupUncertain = append(e.groupUncertain, UncertainEffect{
+							StepIndex: e.step, Token: b.token, Attempt: b.attempt, Key: key, Action: b.spec.Action,
+						})
+					}
+				}
+			}
+		}
 	}
 	return e, nil
 }
@@ -654,6 +768,39 @@ func (e *Engine) Pending() []string {
 			"step %d: action %q invoked but unconfirmed (key %s) — verify externally, then ConfirmAction; it will NOT be retried automatically",
 			e.uncertain.StepIndex, e.uncertain.Action, e.uncertain.Key))
 		return out
+	}
+	for _, u := range e.groupUncertain {
+		out = append(out, fmt.Sprintf(
+			"group step %d: branch %s action %q invoked but unconfirmed (key %s) — retained as an unverified external effect; verify externally, then ConfirmBranchAction; it will NOT vanish or be retried",
+			u.StepIndex, u.Token, u.Action, u.Key))
+	}
+	if e.currentGroup != nil {
+		root := e.currentGroup
+		st := e.groupStatusLocked(root)
+		if st != nil {
+			for _, b := range st.Branches {
+				if b.Terminal {
+					in := "not in decision"
+					if b.InDecision {
+						in = "participates in decision"
+					}
+					out = append(out, fmt.Sprintf("group %s branch %s: %s (%s)%s", st.Token, b.Name, b.Outcome, b.Result, "; "+in))
+				} else {
+					note := "pending"
+					if b.CancelAsked {
+						note = "cancel requested"
+					}
+					if b.Unverified {
+						note = "unverified external effect"
+					}
+					out = append(out, fmt.Sprintf("group %s branch %s: %s", st.Token, b.Name, note))
+				}
+			}
+			if st.Decided {
+				out = append(out, fmt.Sprintf("group %s decided (satisfied=%t) with %d selected branches; failures counted=%t",
+					st.Token, st.Satisfied, len(st.SelectedTokens), st.CountFailures))
+			}
+		}
 	}
 	if e.step < len(e.def.Steps) {
 		st := e.def.Steps[e.step]
