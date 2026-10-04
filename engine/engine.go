@@ -728,6 +728,9 @@ func (e *Engine) Pending() []string {
 				state = "decided-unsatisfied"
 			}
 		}
+		if v.Completed {
+			state += " (step completed; view retained for inspection)"
+		}
 		out = append(out, fmt.Sprintf(
 			"wait group %s (mode=%s failures_count=%v after=%s): %s; selected=%v pending=%v",
 			v.GroupID, v.Mode, v.FailuresCount, v.After, state, v.Selected, v.Pending))

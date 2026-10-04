@@ -186,6 +186,9 @@ type GroupView struct {
 	Quota         int               `json:"quota,omitempty"`
 	FailuresCount bool              `json:"failures_count"`
 	After         AfterMode         `json:"after"`
+	// Completed 表示根步骤已收尾；已完成的组仍然可查询，
+	// 决策、结果归属、迟到结果与未核实效果都不会从视图中消失。
+	Completed     bool              `json:"completed"`
 	Decided       bool              `json:"decided"`
 	Satisfied     bool              `json:"satisfied"`
 	Selected      []string          `json:"selected_branches,omitempty"`
@@ -193,7 +196,9 @@ type GroupView struct {
 	Branches      []GroupBranchView `json:"branches"`
 }
 
-// WaitGroups 返回当前所有未随步骤收尾的等待组快照（含嵌套子组）。
+// WaitGroups 返回当前所有等待组快照（含嵌套子组）。
+// 已完成的组保留可查询状态：唯一决策、参与决策的结果、
+// 仍在等待的分支与迟到结果都继续可见。
 func (e *Engine) WaitGroups() []GroupView {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -209,15 +214,12 @@ func (e *Engine) waitGroupsLocked() []GroupView {
 	sort.Ints(steps)
 	for _, si := range steps {
 		root := e.groups[si]
-		if e.completed[root.stepIndex] {
-			continue
-		}
-		collectGroupViews(&out, root)
+		collectGroupViews(&out, root, e.completed[root.stepIndex])
 	}
 	return out
 }
 
-func collectGroupViews(out *[]GroupView, g *groupState) {
+func collectGroupViews(out *[]GroupView, g *groupState, completed bool) {
 	v := GroupView{
 		GroupID:       g.id,
 		RootStep:      g.stepIndex,
@@ -225,6 +227,7 @@ func collectGroupViews(out *[]GroupView, g *groupState) {
 		Quota:         g.spec.Quota,
 		FailuresCount: g.spec.FailuresCount,
 		After:         effectiveAfter(g.spec.After),
+		Completed:     completed,
 		Decided:       g.decided,
 		Satisfied:     g.satisfied,
 		Selected:      append([]string(nil), g.selected...),
@@ -286,7 +289,7 @@ func collectGroupViews(out *[]GroupView, g *groupState) {
 	}
 	sort.Strings(rels)
 	for _, rel := range rels {
-		collectGroupViews(out, g.subgroups[rel])
+		collectGroupViews(out, g.subgroups[rel], completed)
 		_ = rel
 	}
 }
