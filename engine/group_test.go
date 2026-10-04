@@ -92,8 +92,9 @@ func TestWaitGroupAllSatisfied(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	if v := eng.WaitGroups(); len(v) != 0 {
-		t.Fatalf("finished step should not list group, got %+v", v)
+	views2 := eng.WaitGroups()
+	if len(views2) != 1 || !views2[0].Decided || !views2[0].Satisfied || len(views2[0].Selected) != 3 {
+		t.Fatalf("finished group stays queryable with its decision: %+v", views2)
 	}
 	ev, _ := store.Load("g1")
 	if countType(ev, EvtGroupDecided) != 1 || countType(ev, EvtRunCompleted) != 1 {
@@ -438,8 +439,14 @@ func TestWaitGroupNested(t *testing.T) {
 	if countType(ev, EvtGroupDecided) != 2 {
 		t.Fatalf("inner and root each decide once, got %d", countType(ev, EvtGroupDecided))
 	}
-	if len(eng.WaitGroups()) != 0 {
-		t.Fatal("no live groups after step completion")
+	views := eng.WaitGroups()
+	if len(views) != 2 {
+		t.Fatalf("decided groups stay queryable, got %d views", len(views))
+	}
+	for _, gv := range views {
+		if !gv.Decided || !gv.Satisfied {
+			t.Fatalf("each layer keeps its own decision: %+v", gv)
+		}
 	}
 }
 
@@ -614,5 +621,69 @@ func TestWaitGroupCancelRace(t *testing.T) {
 	sel, _ := dec.Extra[ExtraSelected].([]interface{})
 	if len(sel) != 1 || sel[0] != "1" {
 		t.Fatalf("only the real result participates, got %v", sel)
+	}
+}
+
+// 已完成的等待组保持可查询：决策、迟到结果、取消请求在视图与重开后都一致。
+func TestWaitGroupDecidedViewRetained(t *testing.T) {
+	newDef := func() Definition {
+		return Definition{ID: 24, Steps: []Step{{Kind: "parallel_wait", Name: "wg", Group: &WaitGroupSpec{
+			Mode: WaitAny, After: AfterCancel,
+			Branches: []BranchSpec{waitBranchSpec(true, "a"), waitBranchSpec(true, "b"), waitBranchSpec(true, "c")},
+		}}}}
+	}
+	check := func(t *testing.T, eng *Engine) {
+		t.Helper()
+		views := eng.WaitGroups()
+		if len(views) != 1 {
+			t.Fatalf("decided group stays queryable, got %d views", len(views))
+		}
+		v := views[0]
+		if !v.Decided || !v.Satisfied || len(v.Selected) != 1 || v.Selected[0] != "0" {
+			t.Fatalf("unique decision and selected set retained: %+v", v)
+		}
+		byPath := map[string]GroupBranchView{}
+		for _, b := range v.Branches {
+			byPath[b.Path] = b
+		}
+		late := byPath["1"]
+		if !late.CancelRequested || late.Selected || len(late.AttemptResults) != 2 || late.AttemptResults[1] != "late" {
+			t.Fatalf("late result kept in its own branch attempt record: %+v", late)
+		}
+		canceled := byPath["2"]
+		if !canceled.CancelRequested || canceled.Status != branchCanceled {
+			t.Fatalf("cancel-requested branch still reported: %+v", canceled)
+		}
+	}
+	dir := t.TempDir()
+	store, _ := NewStore(dir)
+	eng1 := NewEngine(store, systemClock{}, Hooks{})
+	done := startAsync(t, eng1, newDef(), "g15", nil)
+	waitForEvent(t, store, "g15", EvtGroupScheduled)
+	if err := eng1.DeliverGroupResult(branchTok("g15", 0, "0"), "win"); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	// 决策后的迟到结果：留在自己的分支上，标 stale，不改变 selected。
+	if err := eng1.DeliverGroupResult(branchTok("g15", 0, "1"), "late"); err != nil {
+		t.Fatal(err)
+	}
+	check(t, eng1)
+	eng1.Close()
+	// 保存并重开：决策、分支归属、迟到结果与取消请求与退出前一致。
+	eng2, err := Recover(store, systemClock{}, newDef(), "g15", Hooks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	check(t, eng2)
+	if err := eng2.Run(nil); err != nil {
+		t.Fatal(err)
+	}
+	check(t, eng2)
+	ev := mustLoad(t, store, "g15")
+	if countType(ev, EvtGroupDecided) != 1 {
+		t.Fatalf("decision stays unique across save/reopen: %v", typesOf(ev))
 	}
 }

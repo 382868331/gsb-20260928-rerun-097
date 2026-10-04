@@ -193,7 +193,9 @@ type GroupView struct {
 	Branches      []GroupBranchView `json:"branches"`
 }
 
-// WaitGroups 返回当前所有未随步骤收尾的等待组快照（含嵌套子组）。
+// WaitGroups 返回全部等待组快照（含嵌套子组）。组决策并收尾步骤后
+// 视图仍然保留：唯一决策、参与决策的结果、仍在等待的分支与迟到结果
+// 都可继续查询；迟到结果标 stale，不改变已确认的选定集合。
 func (e *Engine) WaitGroups() []GroupView {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -209,9 +211,6 @@ func (e *Engine) waitGroupsLocked() []GroupView {
 	sort.Ints(steps)
 	for _, si := range steps {
 		root := e.groups[si]
-		if e.completed[root.stepIndex] {
-			continue
-		}
 		collectGroupViews(&out, root)
 	}
 	return out
@@ -930,6 +929,11 @@ func (e *Engine) replayGroupEventLocked(ev Event) {
 		if leaf == nil {
 			return
 		}
+		if ev.Type == EvtGroupTimedOut {
+			if reason, _ := ev.Extra[ExtraReason].(string); reason == "group_timeout" {
+				leaf.cancelReq = true
+			}
+		}
 		e.replayOutcomeLocked(root, leaf, ev.Seq, attempt, ev.Type, ev.Result)
 	case EvtGroupRetried:
 		root := e.groups[ev.StepIndex]
@@ -945,6 +949,13 @@ func (e *Engine) replayGroupEventLocked(ev Event) {
 		root := e.groups[ev.StepIndex]
 		leaf := root.flatLeaves[path]
 		leaf.cancelReq = true
+		// 与 finalizeGroupLocked 一致：取消请求本身即该 attempt 的终局，
+		// 重放时补回同一归属，保证重开后视图与退出前一致。
+		oc := &attemptOutcome{attempt: extraInt(ev.Extra, ExtraAttempt), kind: EvtGroupCanceled, result: "cancel_requested"}
+		leaf.attempts = append(leaf.attempts, oc)
+		if leaf.outcome == nil {
+			leaf.outcome = oc
+		}
 	case EvtGroupDecided:
 		root := findGroupByIDLocked(e, gid)
 		if root == nil {
@@ -974,14 +985,14 @@ func (e *Engine) replayGroupEventLocked(ev Event) {
 // replayOutcomeLocked 重放一个叶子终局：决策后的终局标记 stale，不改变归属。
 func (e *Engine) replayOutcomeLocked(root *groupState, leaf *leafState, seq int64, attempt int, kind EventType, result string) {
 	for _, a := range leaf.attempts {
-		if a.attempt == attempt {
+		if a.attempt == attempt && a.kind == kind {
 			return
 		}
 	}
 	oc := &attemptOutcome{attempt: attempt, kind: kind, result: result, seq: seq}
 	leaf.attempts = append(leaf.attempts, oc)
 	owner := owningGroupLocked(root, leaf.path)
-	if owner.decided || attempt != leaf.liveAttempt {
+	if owner.decided || attempt != leaf.liveAttempt || leaf.cancelReq {
 		oc.stale = true
 	}
 	if leaf.outcome == nil {
