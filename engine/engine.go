@@ -81,6 +81,10 @@ type Engine struct {
 	acked       map[string]bool // 已确认的动作 key
 	ackedResult map[string]string
 	uncertain   *UncertainAction
+
+	// 并行等待组：根步骤 -> 根组；groupUncertain 保存组内未核实效果。
+	groups         map[int]*groupState
+	groupUncertain map[string]*leafState
 }
 
 func NewEngine(store *Store, clock Clock, hooks Hooks) *Engine {
@@ -88,16 +92,18 @@ func NewEngine(store *Store, clock Clock, hooks Hooks) *Engine {
 		clock = systemClock{}
 	}
 	e := &Engine{
-		store:       store,
-		clock:       clock,
-		hooks:       hooks,
-		results:     map[string]string{},
-		canceled:    map[string]bool{},
-		decided:     map[string]EventType{},
-		recorded:    map[string]bool{},
-		completed:   map[int]bool{},
-		acked:       map[string]bool{},
-		ackedResult: map[string]string{},
+		store:          store,
+		clock:          clock,
+		hooks:          hooks,
+		results:        map[string]string{},
+		canceled:       map[string]bool{},
+		decided:        map[string]EventType{},
+		recorded:       map[string]bool{},
+		completed:      map[int]bool{},
+		acked:          map[string]bool{},
+		ackedResult:    map[string]string{},
+		groups:         map[int]*groupState{},
+		groupUncertain: map[string]*leafState{},
 	}
 	e.stopCh = make(chan struct{})
 	e.gen = engineGeneration.Add(1)
@@ -211,7 +217,16 @@ func (e *Engine) Run(actions map[string]Action) error {
 				err = e.await(token, stepIndex, pendingDeadline)
 			}
 		default:
-			err = fmt.Errorf("engine: unknown step kind %q", st.Kind)
+			if st.Kind == "parallel_wait" {
+				if st.Group == nil {
+					err = fmt.Errorf("engine: parallel_wait step %q has no group spec", st.Name)
+				} else {
+					err = e.runGroupStep(stepIndex, st, actions)
+					active = true
+				}
+			} else {
+				err = fmt.Errorf("engine: unknown step kind %q", st.Kind)
+			}
 		}
 		if active {
 			e.mu.Lock()
@@ -405,6 +420,20 @@ func (e *Engine) Close() {
 	e.wait = nil
 	e.waitCh = nil
 	e.timeoutCh = nil
+	for _, g := range e.groups {
+		if g.timer != nil {
+			g.timer.Stop()
+		}
+		for _, leaf := range g.flatLeaves {
+			if leaf.timer != nil {
+				leaf.timer.Stop()
+			}
+		}
+		if g.waitCh != nil {
+			close(g.waitCh)
+			g.waitCh = nil
+		}
+	}
 	close(e.stopCh)
 }
 
@@ -518,6 +547,13 @@ func (e *Engine) CancelWait(token, reason string) error {
 func (e *Engine) deliverExternal(token, value string, canceled bool) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if gtok, leaf, _, ok := e.resolveLeafTokenLocked(token); ok {
+		kind := EvtGroupResult
+		if canceled {
+			kind = EvtGroupCanceled
+		}
+		return e.recordLeafOutcomeLocked(gtok, leaf, currentAttempt(leaf), kind, value, canceled)
+	}
 	duplicate := (!canceled && e.results[token] != "") || (canceled && e.canceled[token])
 	if duplicate {
 		detail := "result"
@@ -610,6 +646,10 @@ func Recover(store *Store, clock Clock, def Definition, runID string, hooks Hook
 			stepDone[ev.StepIndex] = true
 		case EvtRunCompleted:
 			e.done = true
+		default:
+			if isGroupEvent(ev.Type) {
+				e.replayGroupEventLocked(ev)
+			}
 		}
 	}
 	// 下一个未完成的步骤。
@@ -637,6 +677,21 @@ func Recover(store *Store, clock Clock, def Definition, runID string, hooks Hook
 				}
 			}
 		}
+		if st.Kind == "parallel_wait" {
+			if g, ok := e.groups[e.step]; ok {
+				// 动作已调用但崩溃发生在任何结果事件之前：外部效果可能已产生，保留待核实。
+				for _, leaf := range g.flatLeaves {
+					if leaf.invoked && leaf.uncertain == "" && leaf.outcome == nil {
+						key := leafToken(g.id, leaf.path, leaf.liveAttempt) + ":action"
+						leaf.uncertain = key
+						leaf.invokedAttempt = -1
+						e.groupUncertain[key] = leaf
+					}
+				}
+				g.scheduled = true
+				g.waitCh = make(chan struct{}, 1)
+			}
+		}
 	}
 	return e, nil
 }
@@ -646,9 +701,6 @@ func (e *Engine) Pending() []string {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	var out []string
-	if e.done {
-		return []string{"run completed, nothing pending"}
-	}
 	if e.uncertain != nil {
 		out = append(out, fmt.Sprintf(
 			"step %d: action %q invoked but unconfirmed (key %s) — verify externally, then ConfirmAction; it will NOT be retried automatically",
@@ -661,6 +713,27 @@ func (e *Engine) Pending() []string {
 	}
 	for token := range e.results {
 		out = append(out, fmt.Sprintf("external result for token %s arrived, not yet consumed", token))
+	}
+	for _, ua := range e.groupUncertainActionsLocked() {
+		out = append(out, fmt.Sprintf(
+			"wait-group branch %s: action %q invoked but unconfirmed (key %s) — verify externally, then ConfirmGroupAction; it is NOT dropped because the branch is no longer needed",
+			ua.Path, ua.Action, ua.Key))
+	}
+	for _, v := range e.waitGroupsLocked() {
+		state := "open"
+		if v.Decided {
+			if v.Satisfied {
+				state = "decided-satisfied"
+			} else {
+				state = "decided-unsatisfied"
+			}
+		}
+		out = append(out, fmt.Sprintf(
+			"wait group %s (mode=%s failures_count=%v after=%s): %s; selected=%v pending=%v",
+			v.GroupID, v.Mode, v.FailuresCount, v.After, state, v.Selected, v.Pending))
+	}
+	if e.done && len(out) == 0 {
+		return []string{"run completed, nothing pending"}
 	}
 	return out
 }
