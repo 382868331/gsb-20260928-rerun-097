@@ -165,35 +165,46 @@ func collectLeafSpecs(spec *WaitGroupSpec, prefix string, out map[string]*Branch
 
 // GroupBranchView 描述一个分支在等待组视图中的状态。
 type GroupBranchView struct {
-	Path            string   `json:"path"`
-	Name            string   `json:"name"`
-	Status          string   `json:"status"`
-	Result          string   `json:"result,omitempty"`
-	Attempt         int      `json:"attempt"`
-	AttemptResults  []string `json:"attempt_results,omitempty"`
-	Selected        bool     `json:"selected"`
-	Stale           bool     `json:"stale,omitempty"`
-	CancelRequested bool     `json:"cancel_requested,omitempty"`
-	UncertainAction string   `json:"uncertain_action,omitempty"`
+	Path            string             `json:"path"`
+	Name            string             `json:"name"`
+	Status          string             `json:"status"`
+	Result          string             `json:"result,omitempty"`
+	Attempt         int                `json:"attempt"`
+	AttemptResults  []string           `json:"attempt_results,omitempty"`
+	Attempts        []GroupAttemptView `json:"attempts,omitempty"`
+	Selected        bool               `json:"selected"`
+	Stale           bool               `json:"stale,omitempty"`
+	CancelRequested bool               `json:"cancel_requested,omitempty"`
+	UncertainAction string             `json:"uncertain_action,omitempty"`
+}
+
+// GroupAttemptView 是一个分支在某次尝试上实际留下的终局事实。
+// 同一尝试可能有多个事实（先失败/取消，迟到成功后到）；
+// Stale 表示该事实到达时已不能影响分支裁决或本组决策。
+type GroupAttemptView struct {
+	Attempt int    `json:"attempt"`
+	Status  string `json:"status"`
+	Result  string `json:"result,omitempty"`
+	Stale   bool   `json:"stale,omitempty"`
 }
 
 // GroupView 是等待组的可追溯快照：各分支结果、参与最终决策的分支、
 // 尚未完成的分支，以及失败结果是否计入本组条件。
 type GroupView struct {
-	GroupID       string            `json:"group_id"`
-	RootStep      int               `json:"root_step"`
-	Mode          WaitMode          `json:"mode"`
-	Quota         int               `json:"quota,omitempty"`
-	FailuresCount bool              `json:"failures_count"`
-	After         AfterMode         `json:"after"`
+	GroupID       string    `json:"group_id"`
+	RootStep      int       `json:"root_step"`
+	Mode          WaitMode  `json:"mode"`
+	Quota         int       `json:"quota,omitempty"`
+	FailuresCount bool      `json:"failures_count"`
+	After         AfterMode `json:"after"`
 	// Completed 表示根步骤已收尾；已完成的组仍然可查询，
 	// 决策、结果归属、迟到结果与未核实效果都不会从视图中消失。
-	Completed     bool              `json:"completed"`
-	Decided       bool              `json:"decided"`
-	Satisfied     bool              `json:"satisfied"`
-	Selected      []string          `json:"selected_branches,omitempty"`
-	Pending       []string          `json:"pending_branches,omitempty"`
-	Branches      []GroupBranchView `json:"branches"`
+	Completed bool              `json:"completed"`
+	Decided   bool              `json:"decided"`
+	Satisfied bool              `json:"satisfied"`
+	Selected  []string          `json:"selected_branches,omitempty"`
+	Pending   []string          `json:"pending_branches,omitempty"`
+	Branches  []GroupBranchView `json:"branches"`
 }
 
 // WaitGroups 返回当前所有等待组快照（含嵌套子组）。
@@ -277,6 +288,20 @@ func collectGroupViews(out *[]GroupView, g *groupState, completed bool) {
 		}
 		for _, a := range leaf.attempts {
 			bv.AttemptResults = append(bv.AttemptResults, a.result)
+			st := ""
+			switch a.kind {
+			case EvtGroupResult:
+				st = branchSucceeded
+			case EvtGroupFailure:
+				st = branchFailed
+			case EvtGroupCanceled:
+				st = branchCanceled
+			case EvtGroupTimedOut:
+				st = branchTimedOut
+			}
+			bv.Attempts = append(bv.Attempts, GroupAttemptView{
+				Attempt: a.attempt, Status: st, Result: a.result, Stale: a.stale,
+			})
 		}
 		v.Branches = append(v.Branches, bv)
 	}
@@ -482,20 +507,20 @@ func (e *Engine) armLeafLocked(root *groupState, leaf *leafState, actions map[st
 // 组决策后到达的结果仍落盘但标记 stale，不改变已选定的结果集合。
 func (e *Engine) recordLeafOutcomeLocked(root *groupState, leaf *leafState, attempt int, kind EventType, result string, canceled bool) error {
 	owner := owningGroupLocked(root, leaf.path)
+	sameKind := false
 	for _, a := range leaf.attempts {
 		if a.attempt == attempt {
-			if owner.decided || leaf.cancelReq {
-				if a.kind == kind {
-					// 同类迟到信号重复：只记 duplicate。
-					return e.appendLocked(Event{Type: EvtExternalDuplicate, StepIndex: root.stepIndex, Token: leaf.token, Result: result, Detail: string(kind), Extra: map[string]interface{}{ExtraGroupID: root.id, ExtraBranch: leaf.path, ExtraAttempt: attempt}})
-				}
-				// 决策已定或已请求取消：另一类迟到结果仍按自身事件记录并标 stale。
-				break
+			if a.kind == kind {
+				sameKind = true
 			}
-			// 同一 attempt 的重复/竞争信号：只补记 duplicate，不改裁决。
-			return e.appendLocked(Event{Type: EvtExternalDuplicate, StepIndex: root.stepIndex, Token: leaf.token, Result: result, Detail: string(kind), Extra: map[string]interface{}{ExtraGroupID: root.id, ExtraBranch: leaf.path, ExtraAttempt: attempt}})
 		}
 	}
+	if sameKind {
+		// 同一尝试的同类迟到通知只可能重复：补记 duplicate，不改任何事实。
+		return e.appendLocked(Event{Type: EvtExternalDuplicate, StepIndex: root.stepIndex, Token: leaf.token, Result: result, Detail: string(kind), Extra: map[string]interface{}{ExtraGroupID: root.id, ExtraBranch: leaf.path, ExtraAttempt: attempt}})
+	}
+	// 不同类型的迟到信号（如已失败/已取消尝试的迟到成功）是真实发生的事实：
+	// 作为该尝试自己的终局事实追加保留，但不参与本组决策，也不改写分支终局。
 	oc := &attemptOutcome{attempt: attempt, kind: kind, result: result}
 	leaf.attempts = append(leaf.attempts, oc)
 	ev := Event{Type: kind, StepIndex: root.stepIndex, Token: leaf.token, Result: result,
@@ -506,11 +531,13 @@ func (e *Engine) recordLeafOutcomeLocked(root *groupState, leaf *leafState, atte
 		return err
 	}
 	oc.seq = seq
-	if owner.decided || attempt != leaf.liveAttempt || leaf.cancelReq {
-		// 决策已定 / 旧 attempt / 已请求取消：记录但不改变已选定的结果集合。
+	// 下列终局事实只属于历史，不改变分支裁决与已确认的选定集合：
+	// 组已决策、属于旧尝试（已重试）、已请求取消、或该分支已有在先终局。
+	if owner.decided || attempt != leaf.liveAttempt || leaf.cancelReq || leaf.outcome != nil {
 		oc.stale = true
 	}
-	if leaf.outcome == nil {
+	// 分支终局只由当前在途尝试占据；旧尝试的迟到事实不得覆盖新尝试。
+	if leaf.outcome == nil && attempt == leaf.liveAttempt {
 		leaf.outcome = oc
 	}
 	e.reevaluateLeafLocked(root, leaf)
@@ -946,8 +973,22 @@ func (e *Engine) replayGroupEventLocked(ev Event) {
 		leaf.invokedAttempt = -1
 	case EvtGroupCancelReq:
 		root := e.groups[ev.StepIndex]
+		if root == nil || path == "" {
+			return
+		}
 		leaf := root.flatLeaves[path]
+		if leaf == nil {
+			return
+		}
 		leaf.cancelReq = true
+		// 与运行期 finalizeGroupLocked 完全一致：取消请求一经发出，
+		// 当前在途尝试即以 canceled 终局（不另落终局事件）；
+		// 之后到达的迟到结果只能作为该尝试的 stale 事实，重开后不得翻盘成成功。
+		oc := &attemptOutcome{attempt: attempt, kind: EvtGroupCanceled, result: "cancel_requested"}
+		leaf.attempts = append(leaf.attempts, oc)
+		if leaf.outcome == nil && attempt == leaf.liveAttempt {
+			leaf.outcome = oc
+		}
 	case EvtGroupDecided:
 		root := findGroupByIDLocked(e, gid)
 		if root == nil {
@@ -974,20 +1015,30 @@ func (e *Engine) replayGroupEventLocked(ev Event) {
 	}
 }
 
-// replayOutcomeLocked 重放一个叶子终局：决策后的终局标记 stale，不改变归属。
+// replayOutcomeLocked 重放一个叶子终局事实。同一尝试可能先后留下多个
+// 不同类型的事实（先失败/取消，迟到成功随后到达）：它们都按实际所属尝试
+// 保留；决策后、旧尝试或迟到的事实标 stale，不占据分支终局，
+// 不覆盖新尝试结果，也不改变已确认的选定集合。
 func (e *Engine) replayOutcomeLocked(root *groupState, leaf *leafState, seq int64, attempt int, kind EventType, result string) {
+	sameKind := false
 	for _, a := range leaf.attempts {
 		if a.attempt == attempt {
-			return
+			if a.kind == kind {
+				sameKind = true
+			}
 		}
+	}
+	if sameKind {
+		// 同类重复事件（重放本身不会重复，但防止历史中重复行改变事实）。
+		return
 	}
 	oc := &attemptOutcome{attempt: attempt, kind: kind, result: result, seq: seq}
 	leaf.attempts = append(leaf.attempts, oc)
 	owner := owningGroupLocked(root, leaf.path)
-	if owner.decided || attempt != leaf.liveAttempt {
+	if owner.decided || attempt != leaf.liveAttempt || leaf.cancelReq || leaf.outcome != nil {
 		oc.stale = true
 	}
-	if leaf.outcome == nil {
+	if leaf.outcome == nil && attempt == leaf.liveAttempt {
 		leaf.outcome = oc
 	}
 }

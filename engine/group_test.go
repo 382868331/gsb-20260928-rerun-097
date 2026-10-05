@@ -727,3 +727,250 @@ func TestWaitGroupCompletedViewSurvivesReopen(t *testing.T) {
 		t.Fatal("still exactly one decision after reopen")
 	}
 }
+
+func findBranchView(t *testing.T, v GroupView, path string) GroupBranchView {
+	t.Helper()
+	for _, b := range v.Branches {
+		if b.Path == path {
+			return b
+		}
+	}
+	t.Fatalf("branch %s not in view: %+v", path, v.Branches)
+	return GroupBranchView{}
+}
+
+func attemptsOf(bv GroupBranchView, attempt int) []GroupAttemptView {
+	var out []GroupAttemptView
+	for _, a := range bv.Attempts {
+		if a.Attempt == attempt {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// 重试成功后补到旧尝试的迟到结果：必须留在旧尝试中，
+// 退出前与多次重开后都不得覆盖新尝试结果，也不得改变选定集合。
+func TestWaitGroupRetryLateResultStaysInOldAttempt(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := NewStore(dir)
+	def := Definition{ID: 30, Steps: []Step{{Kind: "parallel_wait", Name: "wg", Group: &WaitGroupSpec{
+		Mode:     WaitAll,
+		Branches: []BranchSpec{waitBranchSpec(true, "a"), waitBranchSpec(true, "b")},
+	}}}}
+	eng := NewEngine(store, systemClock{}, Hooks{})
+	done := startAsync(t, eng, def, "g20", nil)
+	waitForEvent(t, store, "g20", EvtGroupScheduled)
+	oldToken := branchTok("g20", 0, "0")
+	if err := eng.DeliverGroupFailure(oldToken, "bad"); err != nil {
+		t.Fatal(err)
+	}
+	newToken, err := eng.RetryGroupBranch(groupRootID("g20", 0), "0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 新尝试先成功；随后旧尝试的迟到成功才补到。
+	if err := eng.DeliverGroupResult(newToken, "good"); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.DeliverGroupResult(oldToken, "late-old"); err != nil {
+		t.Fatal(err)
+	}
+	v := eng.WaitGroups()[0]
+	bv := findBranchView(t, v, "0")
+	if bv.Status != branchSucceeded || bv.Attempt != 1 || bv.Result != "good" {
+		t.Fatalf("late old-attempt result must not overwrite the new attempt: %+v", bv)
+	}
+	old := attemptsOf(bv, 0)
+	if len(old) != 2 || old[0].Status != branchFailed ||
+		old[1].Status != branchSucceeded || !old[1].Stale {
+		t.Fatalf("late result stays in old attempt 0 as stale: %+v", bv.Attempts)
+	}
+	if err := eng.DeliverGroupResult(branchTok("g20", 0, "1"), "ok"); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	eng.Close()
+
+	// 多次重开：每次恢复的视图都必须与退出前事实一致。
+	for i := 0; i < 2; i++ {
+		restored, err := Recover(store, systemClock{}, def, "g20", Hooks{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		v := restored.WaitGroups()[0]
+		if !v.Decided || !v.Satisfied || len(v.Selected) != 2 {
+			t.Fatalf("reopen %d: decision/selected changed: %+v", i, v)
+		}
+		b := findBranchView(t, v, "0")
+		if b.Attempt != 1 || b.Status != branchSucceeded || b.Result != "good" || !b.Selected {
+			t.Fatalf("reopen %d: new attempt must own the branch outcome and selection: %+v", i, b)
+		}
+		old := attemptsOf(b, 0)
+		if len(b.Attempts) != 3 || len(old) != 2 || old[0].Status != branchFailed || old[0].Stale ||
+			old[1].Status != branchSucceeded || !old[1].Stale || old[1].Result != "late-old" {
+			t.Fatalf("reopen %d: old attempt keeps failure then stale late success: %+v", i, b.Attempts)
+		}
+		restored.Close()
+	}
+}
+
+// 已请求取消的分支收到迟到成功：退出前仍标取消；重开后也必须仍是取消，
+// 迟到成功只作为该尝试的 stale 事实保留；重复迟到通知不改变任何事实。
+func TestWaitGroupCanceledBranchLateResultAcrossReopen(t *testing.T) {
+	t.Run("after=cancel group decision", func(t *testing.T) {
+		dir := t.TempDir()
+		store, _ := NewStore(dir)
+		def := Definition{ID: 31, Steps: []Step{{Kind: "parallel_wait", Name: "wg", Group: &WaitGroupSpec{
+			Mode: WaitAny, After: AfterCancel,
+			Branches: []BranchSpec{waitBranchSpec(true, "a"), waitBranchSpec(true, "b")},
+		}}}}
+		eng := NewEngine(store, systemClock{}, Hooks{})
+		done := startAsync(t, eng, def, "g21", nil)
+		waitForEvent(t, store, "g21", EvtGroupScheduled)
+		if err := eng.DeliverGroupResult(branchTok("g21", 0, "1"), "win"); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		if err := eng.DeliverGroupResult(branchTok("g21", 0, "0"), "late-after-cancel"); err != nil {
+			t.Fatal(err)
+		}
+		b := findBranchView(t, eng.WaitGroups()[0], "0")
+		if b.Status != branchCanceled || !b.CancelRequested || b.Selected {
+			t.Fatalf("canceled branch stays canceled with late result: %+v", b)
+		}
+		if len(b.Attempts) != 2 || b.Attempts[0].Status != branchCanceled ||
+			b.Attempts[1].Status != branchSucceeded || !b.Attempts[1].Stale {
+			t.Fatalf("late success is a stale fact on the canceled attempt: %+v", b.Attempts)
+		}
+		eng.Close()
+
+		restored, err := Recover(store, systemClock{}, def, "g21", Hooks{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		v := restored.WaitGroups()[0]
+		if len(v.Selected) != 1 || v.Selected[0] != "1" {
+			t.Fatalf("selected set frozen: %v", v.Selected)
+		}
+		b = findBranchView(t, v, "0")
+		if b.Status != branchCanceled || !b.CancelRequested || b.Result != "cancel_requested" {
+			t.Fatalf("reopen must not turn canceled branch into success: %+v", b)
+		}
+		if len(b.Attempts) != 2 || b.Attempts[1].Status != branchSucceeded || !b.Attempts[1].Stale {
+			t.Fatalf("reopen keeps late success stale under cancel: %+v", b.Attempts)
+		}
+		// 重开后重复迟到通知：只补 duplicate，视图不变。
+		if err := restored.DeliverGroupResult(branchTok("g21", 0, "0"), "late-after-cancel-again"); err != nil {
+			t.Fatal(err)
+		}
+		ev := mustLoad(t, store, "g21")
+		if countType(ev, EvtGroupDecided) != 1 {
+			t.Fatalf("single decision survives interleaving and reopen: %v", typesOf(ev))
+		}
+		b = findBranchView(t, restored.WaitGroups()[0], "0")
+		if b.Status != branchCanceled || len(b.Attempts) != 2 {
+			t.Fatalf("duplicate late notification changes nothing: %+v", b)
+		}
+	})
+
+	t.Run("external cancel then result interleave", func(t *testing.T) {
+		dir := t.TempDir()
+		store, _ := NewStore(dir)
+		def := Definition{ID: 32, Steps: []Step{{Kind: "parallel_wait", Name: "wg", Group: &WaitGroupSpec{
+			Mode: WaitQuorum, Quota: 1, After: AfterCollect,
+			Branches: []BranchSpec{waitBranchSpec(true, "a"), waitBranchSpec(true, "b")},
+		}}}}
+		eng := NewEngine(store, systemClock{}, Hooks{})
+		done := startAsync(t, eng, def, "g22", nil)
+		waitForEvent(t, store, "g22", EvtGroupScheduled)
+		// 取消先到，迟到成功与取消交错；再由另一分支满足。
+		if err := eng.CancelGroupBranch(branchTok("g22", 0, "0"), "abort"); err != nil {
+			t.Fatal(err)
+		}
+		if err := eng.DeliverGroupResult(branchTok("g22", 0, "0"), "late-vs-cancel"); err != nil {
+			t.Fatal(err)
+		}
+		if err := eng.DeliverGroupResult(branchTok("g22", 0, "1"), "win"); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		eng.Close()
+		restored, err := Recover(store, systemClock{}, def, "g22", Hooks{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		v := restored.WaitGroups()[0]
+		b := findBranchView(t, v, "0")
+		if b.Status != branchCanceled || len(v.Selected) != 1 || v.Selected[0] != "1" {
+			t.Fatalf("cancel/result interleave restored as observed: status=%s selected=%v", b.Status, v.Selected)
+		}
+		if len(b.Attempts) != 2 || b.Attempts[0].Status != branchCanceled ||
+			b.Attempts[1].Status != branchSucceeded || !b.Attempts[1].Stale {
+			t.Fatalf("late success stays stale after reopen: %+v", b.Attempts)
+		}
+	})
+}
+
+// 多层等待组中的同名分支：迟到结果与决策在多次重开后仍按路径区分、可查询。
+func TestWaitGroupNestedSameNameLateResultsReopen(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := NewStore(dir)
+	inner := &WaitGroupSpec{Mode: WaitAny, After: AfterCollect,
+		Branches: []BranchSpec{waitBranchSpec(true, "x"), waitBranchSpec(true, "x")}}
+	def := Definition{ID: 33, Steps: []Step{{Kind: "parallel_wait", Name: "wg", Group: &WaitGroupSpec{
+		Mode: WaitAll,
+		Branches: []BranchSpec{
+			{Name: "x", Wait: true},
+			{Name: "x", Group: inner},
+		},
+	}}}}
+	eng := NewEngine(store, systemClock{}, Hooks{})
+	done := startAsync(t, eng, def, "g23", nil)
+	waitForEvent(t, store, "g23", EvtGroupScheduled)
+	if err := eng.DeliverGroupResult(branchTok("g23", 0, "0"), "outer"); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.DeliverGroupResult(branchTok("g23", 0, "1.0"), "inner"); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	// 内层未被选中的同名分支迟到结果。
+	if err := eng.DeliverGroupResult(branchTok("g23", 0, "1.1"), "inner-late"); err != nil {
+		t.Fatal(err)
+	}
+	eng.Close()
+	restored, err := Recover(store, systemClock{}, def, "g23", Hooks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	views := restored.WaitGroups()
+	if len(views) != 2 {
+		t.Fatalf("root and nested group both queryable: %+v", views)
+	}
+	var innerView *GroupView
+	for i := range views {
+		if views[i].GroupID != views[0].GroupID {
+			innerView = &views[i]
+		}
+	}
+	if innerView == nil {
+		t.Fatalf("nested group view missing: %+v", views)
+	}
+	late := findBranchView(t, *innerView, "1.1")
+	win := findBranchView(t, *innerView, "1.0")
+	if late.Name != win.Name || late.Path == win.Path {
+		t.Fatalf("same-name branches distinguished by path: %+v %+v", late, win)
+	}
+	if late.Result != "inner-late" || !late.Stale || late.Selected || !win.Selected {
+		t.Fatalf("nested late result stays stale on its own attempt: %+v %+v", late, win)
+	}
+}
